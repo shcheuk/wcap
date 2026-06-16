@@ -9,11 +9,14 @@
 #define CONFIG_VIDEO_H264 0
 #define CONFIG_VIDEO_H265 1
 #define CONFIG_VIDEO_AV1  2
+#define CONFIG_VIDEO_RAW  3
 
 #define CONFIG_VIDEO_BASE    0
 #define CONFIG_VIDEO_MAIN    1
 #define CONFIG_VIDEO_HIGH    2
 #define CONFIG_VIDEO_MAIN_10 3
+#define CONFIG_VIDEO_RGB     4
+#define CONFIG_VIDEO_RGBA    5
 
 #define CONFIG_AUDIO_AAC  0
 #define CONFIG_AUDIO_FLAC 1
@@ -154,8 +157,8 @@ static BOOL Config_ShowDialog(Config* C);
 static const DWORD gAudioBitrates[] = { 96, 128, 160, 192, 0 };
 static const DWORD gAudioSamplerates[] = { 44100, 48000, 0 };
 
-static const LPCWSTR gVideoCodecs[] = { L"H264", L"H265", L"AV1", NULL};
-static const LPCWSTR gVideoProfiles[] = { L"Base", L"Main", L"High", L"Main10", NULL };
+static const LPCWSTR gVideoCodecs[] = { L"H264", L"H265", L"AV1", L"RAW", NULL};
+static const LPCWSTR gVideoProfiles[] = { L"Base", L"Main", L"High", L"Main10", L"RGB", L"RGBA", NULL };
 static const LPCWSTR gAudioCodecs[] = { L"AAC", L"FLAC", NULL };
 
 static const int gValidVideoProfiles[][4] =
@@ -163,6 +166,7 @@ static const int gValidVideoProfiles[][4] =
 	{ CONFIG_VIDEO_BASE, CONFIG_VIDEO_MAIN, CONFIG_VIDEO_HIGH, -1 },
 	{ CONFIG_VIDEO_MAIN, CONFIG_VIDEO_MAIN_10, -1 },
 	{ CONFIG_VIDEO_MAIN, CONFIG_VIDEO_MAIN_10, -1 },
+	{ CONFIG_VIDEO_RGB, CONFIG_VIDEO_RGBA, -1 },
 };
 
 // currently open dialog window
@@ -210,6 +214,15 @@ static void Config__UpdateVideoProfiles(HWND Window, DWORD Codec)
 		ComboBox_SetItemData(Control, 0, CONFIG_VIDEO_MAIN);
 		ComboBox_SetItemData(Control, 1, CONFIG_VIDEO_MAIN_10);
 		ComboBox_SetCurSel(Control, 1);
+	}
+	else if (Codec == CONFIG_VIDEO_RAW)
+	{
+		ComboBox_AddString(Control, L"24-bit RGB");
+		ComboBox_AddString(Control, L"32-bit RGBA");
+
+		ComboBox_SetItemData(Control, 0, CONFIG_VIDEO_RGB);
+		ComboBox_SetItemData(Control, 1, CONFIG_VIDEO_RGBA);
+		ComboBox_SetCurSel(Control, 0);
 	}
 }
 
@@ -460,6 +473,7 @@ static LRESULT CALLBACK Config__DialogProc(HWND Window, UINT Message, WPARAM WPa
 		SendDlgItemMessageW(Window, ID_VIDEO_CODEC, CB_ADDSTRING, 0, (LPARAM)L"H264 / AVC");
 		SendDlgItemMessageW(Window, ID_VIDEO_CODEC, CB_ADDSTRING, 0, (LPARAM)L"H265 / HEVC");
 		SendDlgItemMessageW(Window, ID_VIDEO_CODEC, CB_ADDSTRING, 0, (LPARAM)L"AV1");
+		SendDlgItemMessageW(Window, ID_VIDEO_CODEC, CB_ADDSTRING, 0, (LPARAM)L"Uncompressed");
 
 		SendDlgItemMessageW(Window, ID_AUDIO_CODEC, CB_ADDSTRING, 0, (LPARAM)L"AAC");
 		SendDlgItemMessageW(Window, ID_AUDIO_CODEC, CB_ADDSTRING, 0, (LPARAM)L"FLAC");

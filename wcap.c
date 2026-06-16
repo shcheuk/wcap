@@ -211,7 +211,9 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 	}
 
 	WCHAR Filename[256];
-	StrFormat(Filename, L"%04u%02u%02u_%02u%02u%02u.mp4", Time.wYear, Time.wMonth, Time.wDay, Time.wHour, Time.wMinute, Time.wSecond);
+	StrFormat(Filename, L"%04u%02u%02u_%02u%02u%02u.%hs",
+		Time.wYear, Time.wMonth, Time.wDay, Time.wHour, Time.wMinute, Time.wSecond,
+		(gConfig.VideoCodec == CONFIG_VIDEO_RAW) ? "avi" : "mp4");
 
 	StrCpyW(gRecordingPath, gConfig.OutputFolder);
 	PathAppendW(gRecordingPath, Filename);
@@ -242,7 +244,8 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 		.Config = &gConfig,
 	};
 
-	if (gConfig.CaptureAudio)
+	BOOL WithAudio = gConfig.CaptureAudio && (gConfig.VideoCodec != CONFIG_VIDEO_RAW);
+	if (WithAudio)
 	{
 		HWND ApplicationWindow = gConfig.ApplicationLocalAudio && AudioCapture_CanCaptureApplicationLocal() ? Window : NULL;
 		if (!AudioCapture_Start(&gAudio, ApplicationWindow))
@@ -257,7 +260,7 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 
 	if (!Encoder_Start(&gEncoder, Device, gRecordingPath, &EncConfig))
 	{
-		if (gConfig.CaptureAudio)
+		if (WithAudio)
 		{
 			AudioCapture_Stop(&gAudio);
 		}
@@ -272,7 +275,7 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 	gRecordingDroppedFrames = 0;
 	ScreenCapture_Start(&gCapture, gConfig.MouseCursor, gConfig.ShowRecordingBorder, gConfig.IncludeSecondaryWindows);
 
-	if (gConfig.CaptureAudio)
+	if (WithAudio)
 	{
 		SetTimer(gWindow, WCAP_AUDIO_CAPTURE_TIMER, WCAP_AUDIO_CAPTURE_INTERVAL, NULL);
 	}
@@ -335,7 +338,7 @@ static void StopRecording(void)
 	gRecording = FALSE;
 	SetThreadExecutionState(gRecordingState);
 
-	if (gConfig.CaptureAudio)
+	if (gConfig.CaptureAudio && (gConfig.VideoCodec != CONFIG_VIDEO_RAW))
 	{
 		KillTimer(gWindow, WCAP_AUDIO_CAPTURE_TIMER);
 		AudioCapture_Flush(&gAudio);

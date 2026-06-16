@@ -33,11 +33,12 @@ typedef struct
 	IMFSinkWriter* Writer;
 	int VideoStreamIndex;
 	int AudioStreamIndex;
-
-	ID3D11RenderTargetView* InputView;
-
+	
+	BOOL Uncompressed;
 	TexResize Resize;
 	YuvConvert Convert;
+	ID3D11Texture2D* InputTexture[ENCODER_VIDEO_BUFFER_COUNT];
+	ID3D11RenderTargetView* InputView[ENCODER_VIDEO_BUFFER_COUNT];
 
 	YuvConvertOutput  ConvertOutput[ENCODER_VIDEO_BUFFER_COUNT];
 	IMFSample*        VideoSample[ENCODER_VIDEO_BUFFER_COUNT];
@@ -253,6 +254,12 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 	DWORD OutputWidth = Config->Config->VideoMaxWidth;
 	DWORD OutputHeight = Config->Config->VideoMaxHeight;
 
+	if (Config->Config->VideoCodec == CONFIG_VIDEO_RAW)
+	{
+		// no resizing for uncompressed video
+		OutputWidth = OutputHeight = 0;
+	}
+
 	if (OutputWidth != 0 && OutputHeight == 0)
 	{
 		// limit max width
@@ -314,11 +321,14 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 		OutputHeight = InputHeight;
 	}
 
-	// must be multiple of 2, round upwards
-	InputWidth = (InputWidth + 1) & ~1;
-	InputHeight = (InputHeight + 1) & ~1;
-	OutputWidth = (OutputWidth + 1) & ~1;
-	OutputHeight = (OutputHeight + 1) & ~1;
+	if (Config->Config->VideoCodec != CONFIG_VIDEO_RAW)
+	{
+		// must be multiple of 2 for YUV, round upwards
+		InputWidth = (InputWidth + 1) & ~1;
+		InputHeight = (InputHeight + 1) & ~1;
+		OutputWidth = (OutputWidth + 1) & ~1;
+		OutputHeight = (OutputHeight + 1) & ~1;
+	}
 
 	BOOL Result = FALSE;
 	IMFSinkWriter* Writer = NULL;
@@ -367,12 +377,19 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 		Codec = &MFVideoFormat_AV1;
 		Profile = eAVEncAV1VProfile_Main_420_10;
 	}
+	else if (Config->Config->VideoCodec == CONFIG_VIDEO_RAW)
+	{
+		VideoInputFormat = &MFVideoFormat_ARGB32;
+		Container = &MFTranscodeContainerType_AVI;
+		Codec = (Config->Config->VideoProfile == CONFIG_VIDEO_RGB) ? &MFVideoFormat_RGB24 : &MFVideoFormat_ARGB32;
+	}
 	else
 	{
 		Assert(0);
 	}
 
 	// make sure MFT video encoder exists, some vendors wrongly allow SinkWriter to be created for invalid configuration
+	if (Config->Config->VideoCodec != CONFIG_VIDEO_RAW)
 	{
 		bool Ok = false;
 
@@ -439,7 +456,7 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 	{
 		IMFAttributes* Attributes;
 		HR(MFCreateAttributes(&Attributes, 4));
-		if (Config->Config->HardwareEncoder)
+		if (Config->Config->HardwareEncoder && Config->Config->VideoCodec != CONFIG_VIDEO_RAW)
 		{
 			HR(IMFAttributes_SetUINT32(Attributes, &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE));
 
@@ -459,7 +476,7 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 
 		if (FAILED(hr))
 		{
-			MessageBoxW(NULL, L"Cannot create output mp4 file. Please check the output folder value in settings!", WCAP_TITLE, MB_ICONERROR);
+			MessageBoxW(NULL, L"Cannot create output video file. Please check the output folder value in settings!", WCAP_TITLE, MB_ICONERROR);
 			goto bail;
 		}
 	}
@@ -471,16 +488,23 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 
 		HR(IMFMediaType_SetGUID(Type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video));
 		HR(IMFMediaType_SetGUID(Type, &MF_MT_SUBTYPE, Codec));
-		HR(IMFMediaType_SetUINT32(Type, &MF_MT_MPEG2_PROFILE, Profile));
-		HR(IMFMediaType_SetUINT32(Type, &MF_MT_VIDEO_CHROMA_SITING, MFVideoChromaSubsampling_MPEG2));
-		HR(IMFMediaType_SetUINT32(Type, &MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_Wide));
-		HR(IMFMediaType_SetUINT32(Type, &MF_MT_VIDEO_PRIMARIES, IsHD ? MFVideoPrimaries_BT709 : MFVideoPrimaries_SMPTE170M));
-		HR(IMFMediaType_SetUINT32(Type, &MF_MT_YUV_MATRIX, IsHD ? MFVideoTransferMatrix_BT709 : MFVideoTransferMatrix_BT601));
-		HR(IMFMediaType_SetUINT32(Type, &MF_MT_TRANSFER_FUNCTION, MFVideoPrimaries_BT709));
+		if (Config->Config->VideoCodec == CONFIG_VIDEO_RAW)
+		{
+			HR(IMFMediaType_SetUINT32(Type, &MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE));
+		}
+		else
+		{
+			HR(IMFMediaType_SetUINT32(Type, &MF_MT_MPEG2_PROFILE, Profile));
+			HR(IMFMediaType_SetUINT32(Type, &MF_MT_VIDEO_CHROMA_SITING, MFVideoChromaSubsampling_MPEG2));
+			HR(IMFMediaType_SetUINT32(Type, &MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_Wide));
+			HR(IMFMediaType_SetUINT32(Type, &MF_MT_VIDEO_PRIMARIES, IsHD ? MFVideoPrimaries_BT709 : MFVideoPrimaries_SMPTE170M));
+			HR(IMFMediaType_SetUINT32(Type, &MF_MT_YUV_MATRIX, IsHD ? MFVideoTransferMatrix_BT709 : MFVideoTransferMatrix_BT601));
+			HR(IMFMediaType_SetUINT32(Type, &MF_MT_TRANSFER_FUNCTION, MFVideoPrimaries_BT709));
+			HR(IMFMediaType_SetUINT32(Type, &MF_MT_AVG_BITRATE, Config->Config->VideoBitrate * 1000));
+		}
 		HR(IMFMediaType_SetUINT32(Type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive));
 		HR(IMFMediaType_SetUINT64(Type, &MF_MT_FRAME_RATE, MFT64(Config->FramerateNum, Config->FramerateDen)));
 		HR(IMFMediaType_SetUINT64(Type, &MF_MT_FRAME_SIZE, MFT64(OutputWidth, OutputHeight)));
-		HR(IMFMediaType_SetUINT32(Type, &MF_MT_AVG_BITRATE, Config->Config->VideoBitrate * 1000));
 
 		hr = IMFSinkWriter_AddStream(Writer, Type, &Encoder->VideoStreamIndex);
 		IMFMediaType_Release(Type);
@@ -492,7 +516,7 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 		}
 	}
 
-	// video input type, NV12 or P010 format
+	// video input type, NV12 / P010 / RGB24 / ARGB32
 	{
 		IMFMediaType* Type;
 		HR(MFCreateMediaType(&Type));
@@ -513,6 +537,7 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 	}
 
 	// video encoder parameters
+	if (Config->Config->VideoCodec != CONFIG_VIDEO_RAW)
 	{
 		ICodecAPI* Codec;
 		HR(IMFSinkWriter_GetServiceForStream(Writer, 0, &GUID_NULL, &IID_ICodecAPI, (LPVOID*)&Codec));
@@ -540,7 +565,7 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 		ICodecAPI_Release(Codec);
 	}
 
-	if (Config->AudioFormat)
+	if (Config->AudioFormat && Config->Config->VideoCodec != CONFIG_VIDEO_RAW)
 	{
 		HR(CoCreateInstance(&CLSID_CResamplerMediaObject, NULL, CLSCTX_INPROC_SERVER, &IID_IMFTransform, (LPVOID*)&Resampler));
 
@@ -624,11 +649,55 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 	hr = IMFSinkWriter_BeginWriting(Writer);
 	if (FAILED(hr))
 	{
-		MessageBoxW(NULL, L"Cannot start writing to mp4 file!", WCAP_TITLE, MB_ICONERROR);
+		MessageBoxW(NULL, L"Cannot start writing to video file!", WCAP_TITLE, MB_ICONERROR);
 		goto bail;
 	}
 
-	// input texture
+	if (Config->Config->VideoCodec == CONFIG_VIDEO_RAW)
+	{
+		for (size_t Index = 0; Index < ENCODER_VIDEO_BUFFER_COUNT; Index++)
+		{
+			D3D11_TEXTURE2D_DESC TextureDesc =
+			{
+				.Width = InputWidth,
+				.Height = InputHeight,
+				.MipLevels = 1,
+				.ArraySize = 1,
+				.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS,
+				.SampleDesc = { 1, 0 },
+				.Usage = D3D11_USAGE_DEFAULT,
+				.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+			};
+
+			D3D11_RENDER_TARGET_VIEW_DESC ViewDesc =
+			{
+				.Format = DXGI_FORMAT_B8G8R8A8_UNORM,
+				.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D,
+			};
+
+			ID3D11Device_CreateTexture2D(Device, &TextureDesc, NULL, &Encoder->InputTexture[Index]);
+			ID3D11Device_CreateRenderTargetView(Device, (ID3D11Resource*)Encoder->InputTexture[Index], &ViewDesc, &Encoder->InputView[Index]);
+
+			FLOAT Black[] = { 0, 0, 0, 0 };
+			ID3D11DeviceContext_ClearRenderTargetView(Context, Encoder->InputView[Index], Black);
+
+			IMFSample* VideoSample;
+			HR(MFCreateVideoSampleFromSurface(NULL, &VideoSample));
+
+			IMFMediaBuffer* Buffer;
+			HR(MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown*)Encoder->InputTexture[Index], 0, FALSE, &Buffer));
+
+			UINT32 MaxLength;
+			HR(IMFMediaBuffer_GetMaxLength(Buffer, &MaxLength));
+			HR(IMFMediaBuffer_SetCurrentLength(Buffer, MaxLength));
+
+			HR(IMFSample_AddBuffer(VideoSample, Buffer));
+			IMFMediaBuffer_Release(Buffer);
+
+			Encoder->VideoSample[Index] = VideoSample;
+		}
+	}
+	else // yuv converter
 	{
 		TexResize_Create(&Encoder->Resize, Device, InputWidth, InputHeight, OutputWidth, OutputHeight, Config->Config->GammaCorrectResize, D3D11_BIND_RENDER_TARGET);
 
@@ -637,14 +706,11 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 			.Format = DXGI_FORMAT_B8G8R8A8_UNORM,
 			.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D,
 		};
-		ID3D11Device_CreateRenderTargetView(Device, (ID3D11Resource*)Encoder->Resize.InputTexture, &InputViewDesc, &Encoder->InputView);
+		ID3D11Device_CreateRenderTargetView(Device, (ID3D11Resource*)Encoder->Resize.InputTexture, &InputViewDesc, &Encoder->InputView[0]);
 
 		FLOAT Black[] = { 0, 0, 0, 0 };
-		ID3D11DeviceContext_ClearRenderTargetView(Context, Encoder->InputView, Black);
-	}
+		ID3D11DeviceContext_ClearRenderTargetView(Context, Encoder->InputView[0], Black);
 
-	// yuv converter
-	{
 		YuvColorSpace ColorSpace = IsHD ? YuvColorSpace_BT709 : YuvColorSpace_BT601;
 		YuvConvert_Create(&Encoder->Convert, Device, Encoder->Resize.OutputTexture, OutputWidth, OutputHeight, ColorSpace, Config->Config->ImprovedColorConversion);
 
@@ -719,6 +785,8 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 	Encoder->Context = Context;
 	Encoder->Multithread = Multithread;
 
+	Encoder->Uncompressed = (Config->Config->VideoCodec == CONFIG_VIDEO_RAW);
+
 	Encoder->StartTime = 0;
 	Encoder->Writer = Writer;
 	Writer = NULL;
@@ -756,21 +824,34 @@ void Encoder_Stop(Encoder* Encoder)
 
 	if (Encoder->AudioStreamIndex >= 0)
 	{
-		for (int i = 0; i < ENCODER_AUDIO_BUFFER_COUNT; i++)
+		for (size_t Index = 0; Index < ENCODER_AUDIO_BUFFER_COUNT; Index++)
 		{
-			IMFSample_Release(Encoder->AudioSample[i]);
+			IMFSample_Release(Encoder->AudioSample[Index]);
 		}
 		IMFSample_Release(Encoder->AudioInputSample);
 	}
 
-	for (size_t OutputIndex = 0; OutputIndex < ENCODER_VIDEO_BUFFER_COUNT; OutputIndex++)
+	for (size_t Index = 0; Index < ENCODER_VIDEO_BUFFER_COUNT; Index++)
 	{
-		YuvConvertOutput_Release(&Encoder->ConvertOutput[OutputIndex]);
-		IMFSample_Release(Encoder->VideoSample[OutputIndex]);
+		IMFSample_Release(Encoder->VideoSample[Index]);
+
+		if (Encoder->Uncompressed)
+		{
+			ID3D11Texture2D_Release(Encoder->InputTexture[Index]);
+			ID3D11RenderTargetView_Release(Encoder->InputView[Index]);
+		}
+		else
+		{
+			YuvConvertOutput_Release(&Encoder->ConvertOutput[Index]);
+		}
 	}
-	YuvConvert_Release(&Encoder->Convert);
-	TexResize_Release(&Encoder->Resize);
-	ID3D11RenderTargetView_Release(Encoder->InputView);
+
+	if (!Encoder->Uncompressed)
+	{
+		YuvConvert_Release(&Encoder->Convert);
+		TexResize_Release(&Encoder->Resize);
+		ID3D11RenderTargetView_Release(Encoder->InputView[0]);
+	}
 
 	ID3D11Multithread_Release(Encoder->Multithread);
 	ID3D11DeviceContext_Release(Encoder->Context);
@@ -799,6 +880,9 @@ BOOL Encoder_NewFrame(Encoder* Encoder, ID3D11Texture2D* Texture, RECT Rect, UIN
 
 	// copy to input texture
 	{
+		ID3D11Texture2D* InputTexture     = Encoder->Uncompressed ? Encoder->InputTexture[Index] : Encoder->Resize.InputTexture;
+		ID3D11RenderTargetView* InputView = Encoder->Uncompressed ? Encoder->InputView[Index]    : Encoder->InputView[0];
+
 		D3D11_BOX Box =
 		{
 			.left = Rect.left,
@@ -814,19 +898,23 @@ BOOL Encoder_NewFrame(Encoder* Encoder, ID3D11Texture2D* Texture, RECT Rect, UIN
 		if (Width < Encoder->InputWidth || Height < Encoder->InputHeight)
 		{
 			FLOAT Black[] = { 0, 0, 0, 0 };
-			ID3D11DeviceContext_ClearRenderTargetView(Context, Encoder->InputView, Black);
+			ID3D11DeviceContext_ClearRenderTargetView(Context, InputView, Black);
 
 			Box.right = Box.left + min(Encoder->InputWidth, Box.right);
 			Box.bottom = Box.top + min(Encoder->InputHeight, Box.bottom);
 		}
-		ID3D11DeviceContext_CopySubresourceRegion(Context, (ID3D11Resource*)Encoder->Resize.InputTexture, 0, 0, 0, 0, (ID3D11Resource*)Texture, 0, &Box);
+
+		 ID3D11DeviceContext_CopySubresourceRegion(Context, (ID3D11Resource*)InputTexture, 0, 0, 0, 0, (ID3D11Resource*)Texture, 0, &Box);
 	}
 
-	// resize if needed
-	TexResize_Dispatch(&Encoder->Resize, Context);
+	if (!Encoder->Uncompressed)
+	{
+		// resize if needed
+		TexResize_Dispatch(&Encoder->Resize, Context);
 
-	// convert to YUV
-	YuvConvert_Dispatch(&Encoder->Convert, Context, &Encoder->ConvertOutput[Index]);
+		// convert to YUV
+		YuvConvert_Dispatch(&Encoder->Convert, Context, &Encoder->ConvertOutput[Index]);
+	}
 
 	ID3D11DeviceContext_Flush(Context);
 	ID3D11Multithread_Leave(Encoder->Multithread);
