@@ -459,7 +459,7 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 
 		if (FAILED(hr))
 		{
-			MessageBoxW(NULL, L"Cannot create output mp4 file!", WCAP_TITLE, MB_ICONERROR);
+			MessageBoxW(NULL, L"Cannot create output mp4 file. Please check the output folder value in settings!", WCAP_TITLE, MB_ICONERROR);
 			goto bail;
 		}
 	}
