@@ -132,6 +132,7 @@ static IActivateAudioInterfaceCompletionHandlerVtbl AudioCaptureActivateVtbl =
 static DWORD CALLBACK AudioCapture__Thread(LPVOID Arg)
 {
 	AudioCapture* Capture = Arg;
+	LOG_INFO("AudioCapture__Thread: started (tid=%lu)", GetCurrentThreadId());
 
 	DWORD Task = 0;
 	HANDLE Handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &Task);
@@ -147,6 +148,7 @@ static DWORD CALLBACK AudioCapture__Thread(LPVOID Arg)
 	{
 		if (Capture->Stop)
 		{
+			LOG_INFO("AudioCapture__Thread: stop flag set, exiting loop");
 			break;
 		}
 
@@ -180,7 +182,13 @@ static DWORD CALLBACK AudioCapture__Thread(LPVOID Arg)
 			}
 			else
 			{
-				// TODO: logging/stats when audio ringbuffer is overflowing
+				// throttle: this can fire every few msec when the encoder stalls
+				static uint32_t OverflowCount;
+				OverflowCount++;
+				if (OverflowCount <= 3 || (OverflowCount % 1000) == 0)
+				{
+					LOG_WARN("AudioCapture__Thread: ringbuffer overflow! available=%u needed=%u (total %u)", BufferAvailable, WriteSize, OverflowCount);
+				}
 			}
 
 			HR(IAudioCaptureClient_ReleaseBuffer(CaptureClient, Frames));
@@ -193,11 +201,14 @@ static DWORD CALLBACK AudioCapture__Thread(LPVOID Arg)
 	
 	AvRevertMmThreadCharacteristics(Handle);
 
+	LOG_INFO("AudioCapture__Thread: exiting");
 	return 0;
 }
 
 bool AudioCapture_Start(AudioCapture* Capture, HWND ApplicationWindow)
 {
+	LOG_INFO("AudioCapture_Start: app_window=%p", (void*)ApplicationWindow);
+
 	bool Result = false;
 
 	if (ApplicationWindow)
@@ -399,6 +410,10 @@ bool AudioCapture_Start(AudioCapture* Capture, HWND ApplicationWindow)
 		LARGE_INTEGER Freq;
 		QueryPerformanceFrequency(&Freq);
 		Capture->Freq = Freq.QuadPart;
+
+		LOG_INFO("AudioCapture_Start: thread started, buffer_size=%u format: rate=%lu channels=%lu blockalign=%lu",
+			Capture->BufferSize, Capture->Format->nSamplesPerSec, Capture->Format->nChannels, Capture->Format->nBlockAlign);
+		Result = true;
 	}
 
 	return Result;
@@ -406,9 +421,24 @@ bool AudioCapture_Start(AudioCapture* Capture, HWND ApplicationWindow)
 
 void AudioCapture_Stop(AudioCapture* Capture)
 {
+	LOG_INFO("AudioCapture_Stop: setting stop flag and signaling event");
 	Capture->Stop = true;
 	SetEvent(Capture->Event);
-	WaitForSingleObject(Capture->Thread, INFINITE);
+
+	LOG_INFO("AudioCapture_Stop: waiting for thread to exit...");
+	DWORD WaitResult = WaitForSingleObject(Capture->Thread, 5000); // 5 second timeout
+	if (WaitResult == WAIT_TIMEOUT)
+	{
+		LOG_ERROR("AudioCapture_Stop: thread did not exit within 5 seconds!");
+	}
+	else if (WaitResult == WAIT_FAILED)
+	{
+		LOG_ERROR("AudioCapture_Stop: WaitForSingleObject failed: %lu", GetLastError());
+	}
+	else
+	{
+		LOG_INFO("AudioCapture_Stop: thread exited normally");
+	}
 
 	CloseHandle(Capture->Thread);
 	CloseHandle(Capture->Event);
@@ -428,6 +458,7 @@ void AudioCapture_Stop(AudioCapture* Capture)
 
 void AudioCapture_Flush(AudioCapture* Capture)
 {
+	LOG_INFO("AudioCapture_Flush: stopping audio clients");
 	if (Capture->PlayClient)
 	{
 		HR(IAudioClient_Stop(Capture->PlayClient));

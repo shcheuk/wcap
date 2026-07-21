@@ -1,4 +1,5 @@
 #include "wcap.h"
+#include "wcap_log.h"
 #include "wcap_config.h"
 #include "wcap_audio_capture.h"
 #include "wcap_screen_capture.h"
@@ -201,9 +202,12 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 	SYSTEMTIME Time;
 	GetLocalTime(&Time);
 
+	LOG_INFO("=== StartRecording BEGIN ===");
+
 	int Error = SHCreateDirectoryExW(NULL, gConfig.OutputFolder, NULL);
 	if (Error != ERROR_SUCCESS && Error != ERROR_FILE_EXISTS && Error != ERROR_ALREADY_EXISTS)
 	{
+		LOG_ERROR("Cannot create output folder, error=%d", Error);
 		ShowNotification(L"Cannot create output folder!", L"Cannot Start Recording", NIIF_WARNING);
 		ScreenCapture_Stop(&gCapture);
 		ID3D11Device_Release(Device);
@@ -247,16 +251,19 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 		HWND ApplicationWindow = gConfig.ApplicationLocalAudio && AudioCapture_CanCaptureApplicationLocal() ? Window : NULL;
 		if (!AudioCapture_Start(&gAudio, ApplicationWindow))
 		{
+			LOG_ERROR("AudioCapture_Start failed");
 			ShowNotification(L"Cannot capture audio!", L"Cannot Start Recording", NIIF_WARNING);
 			ScreenCapture_Stop(&gCapture);
 			ID3D11Device_Release(Device);
 			return;
 		}
+		LOG_INFO("Audio capture started, format: rate=%lu channels=%lu", gAudio.Format->nSamplesPerSec, gAudio.Format->nChannels);
 		EncConfig.AudioFormat = gAudio.Format;
 	}
 
 	if (!Encoder_Start(&gEncoder, Device, gRecordingPath, &EncConfig))
 	{
+		LOG_ERROR("Encoder_Start failed");
 		if (gConfig.CaptureAudio)
 		{
 			AudioCapture_Stop(&gAudio);
@@ -265,6 +272,10 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 		ID3D11Device_Release(Device);
 		return;
 	}
+	LOG_INFO("Encoder started, input=%lux%lu output=%lux%lu fps=%lu/%lu",
+		EncConfig.Width, EncConfig.Height,
+		gEncoder.OutputWidth, gEncoder.OutputHeight,
+		gEncoder.FramerateNum, gEncoder.FramerateDen);
 
 	gRecordingNextTooltip = 0;
 	gRecordingNextEncode = 0;
@@ -281,6 +292,8 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 	UpdateTrayIcon(gIcon2);
 	gRecordingState = SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
 	gRecording = TRUE;
+
+	LOG_INFO("=== Recording STARTED === file=%ls", gRecordingPath);
 
 	ID3D11Device_Release(Device);
 }
@@ -332,6 +345,8 @@ static void EncodeCapturedAudio(void)
 
 static void StopRecording(void)
 {
+	LOG_INFO("=== StopRecording BEGIN === dropped_frames=%lu", gRecordingDroppedFrames);
+
 	gRecording = FALSE;
 	SetThreadExecutionState(gRecordingState);
 
@@ -339,13 +354,20 @@ static void StopRecording(void)
 	{
 		KillTimer(gWindow, WCAP_AUDIO_CAPTURE_TIMER);
 		AudioCapture_Flush(&gAudio);
+		LOG_INFO("Flushing audio capture...");
 		EncodeCapturedAudio();
+		LOG_INFO("Stopping audio capture...");
 		AudioCapture_Stop(&gAudio);
 	}
 	KillTimer(gWindow, WCAP_VIDEO_UPDATE_TIMER);
 
+	LOG_INFO("Stopping screen capture...");
 	ScreenCapture_Stop(&gCapture);
+	LOG_INFO("Finalizing encoder...");
 	Encoder_Stop(&gEncoder);
+
+	LOG_INFO("=== Recording STOPPED === file=%ls", gRecordingPath);
+
 	if (gConfig.OpenFolder)
 	{
 		ShowFileInFolder(gRecordingPath);
@@ -376,10 +398,22 @@ static ID3D11Device* CreateDevice(void)
 					// just to be safe
 					Adapter = NULL;
 				}
+				else if (Adapter)
+				{
+					DXGI_ADAPTER_DESC Desc;
+					if (SUCCEEDED(IDXGIAdapter_GetDesc(Adapter, &Desc)))
+					{
+						LOG_INFO("Selected GPU: %ls (vendor=0x%04X)", Desc.Description, Desc.VendorId);
+					}
+				}
 				IDXGIFactory6_Release(Factory6);
 			}
 			IDXGIFactory_Release(Factory);
 		}
+	}
+	else
+	{
+		LOG_INFO("Hardware encoder disabled, using default adapter");
 	}
 
 	ID3D11Device* Device;
@@ -392,6 +426,7 @@ static ID3D11Device* CreateDevice(void)
 	D3D_DRIVER_TYPE Driver = Adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
 	if (FAILED(D3D11CreateDevice(Adapter, Driver, NULL, flags, (D3D_FEATURE_LEVEL[]) { D3D_FEATURE_LEVEL_11_0 }, 1, D3D11_SDK_VERSION, &Device, NULL, NULL)))
 	{
+		LOG_ERROR("D3D11CreateDevice failed");
 		ShowNotification(L"Cannot to create D3D11 device!", L"Error", NIIF_ERROR);
 		Device = NULL;
 	}
@@ -419,6 +454,7 @@ static void CaptureWindow(void)
 	HWND Window = GetForegroundWindow();
 	if (Window == NULL)
 	{
+		LOG_WARN("CaptureWindow: no foreground window");
 		ShowNotification(L"No window is selected!", L"Cannot Start Recording", NIIF_WARNING);
 		return;
 	}
@@ -437,6 +473,7 @@ static void CaptureWindow(void)
 
 	if (Affinity != WDA_NONE)
 	{
+		LOG_WARN("CaptureWindow: window has display affinity set (excluded from capture)");
 		ShowNotification(L"Window is excluded from capture!", L"Cannot Start Recording", NIIF_WARNING);
 		return;
 	}
@@ -444,6 +481,7 @@ static void CaptureWindow(void)
 	LONG ExStyle = GetWindowLongW(Window, GWL_EXSTYLE);
 	if (ExStyle & WS_EX_TOOLWINDOW)
 	{
+		LOG_WARN("CaptureWindow: window is a tool window");
 		ShowNotification(L"Cannot capture toolbar window!", L"Cannot Start Recording", NIIF_WARNING);
 		return;
 	}
@@ -454,8 +492,11 @@ static void CaptureWindow(void)
 		return;
 	}
 
+	LOG_INFO("CaptureWindow: hwnd=%p", (void*)Window);
+
 	if (!ScreenCapture_CreateForWindow(&gCapture, Device, Window, gConfig.OnlyClientArea, !gConfig.KeepRoundedWindowCorners))
 	{
+		LOG_ERROR("ScreenCapture_CreateForWindow failed");
 		ID3D11Device_Release(Device);
 		ShowNotification(L"Cannot record selected window!", L"Error", NIIF_WARNING);
 		return;
@@ -733,12 +774,14 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	}
 	else if (Message == WM_DESTROY)
 	{
+		LOG_INFO("WM_DESTROY - shutting down");
 		if (gRecording)
 		{
 			StopRecording();
 		}
 		RemoveTrayIcon(Window);
 		PostQuitMessage(0);
+		Log__Shutdown();
 		return 0;
 	}
 	else if (Message == WM_CLOSE)
@@ -967,11 +1010,13 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 				if (LParam & 1)
 				{
 					// reject request to suspend when recording
+					LOG_INFO("Rejecting suspend request (recording active)");
 					return BROADCAST_QUERY_DENY;
 				}
 				else
 				{
 					// if cannot prevent suspend, need to stop recording
+					LOG_WARN("System suspend forced - stopping recording");
 					StopRecording();
 				}
 			}
@@ -984,8 +1029,14 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	}
 	else if (Message == WM_WCAP_COMMAND)
 	{
+		// don't log mouse-move hover events, only real interactions
+		if (LOWORD(LParam) != WM_MOUSEMOVE)
+		{
+			LOG_INFO("WM_WCAP_COMMAND: LParam=0x%08X", LParam);
+		}
 		if (LOWORD(LParam) == WM_RBUTTONUP)
 		{
+			LOG_INFO("Tray right-click: creating popup menu");
 			HMENU Menu = CreatePopupMenu();
 			Assert(Menu);
 
@@ -998,7 +1049,9 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			GetCursorPos(&Mouse);
 
 			SetForegroundWindow(Window);
+			LOG_INFO("Tray right-click: calling TrackPopupMenu (blocking)...");
 			int Command = TrackPopupMenu(Menu, TPM_RETURNCMD | TPM_NONOTIFY, Mouse.x, Mouse.y, 0, Window, NULL);
+			LOG_INFO("Tray right-click: TrackPopupMenu returned, Command=%d", Command);
 			if (Command == CMD_WCAP)
 			{
 				ShellExecuteW(NULL, L"open", WCAP_URL, NULL, NULL, SW_SHOWNORMAL);
@@ -1009,32 +1062,41 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			}
 			else if (Command == CMD_SETTINGS)
 			{
+				LOG_INFO("Tray right-click: showing settings dialog...");
 				if (Config_ShowDialog(&gConfig))
 				{
 					Config_Save(&gConfig, gConfigPath);
 					DisableHotKeys();
 					EnableHotKeys();
 				}
+				LOG_INFO("Tray right-click: settings dialog closed");
 			}
 
 			DestroyMenu(Menu);
 		}
 		else if (LOWORD(LParam) == WM_LBUTTONDBLCLK)
 		{
+			LOG_INFO("Tray double-click: recording=%d", gRecording);
 			if (!gRecording)
 			{
+				LOG_INFO("Tray double-click: showing settings dialog...");
 				if (Config_ShowDialog(&gConfig))
 				{
 					Config_Save(&gConfig, gConfigPath);
 					DisableHotKeys();
 					EnableHotKeys();
 				}
+				LOG_INFO("Tray double-click: settings dialog closed");
 			}
 		}
 		else if (LOWORD(LParam) == NIN_BALLOONUSERCLICK)
 		{
-			// TODO: no idea how to prevent this happening for right-click on tray icon...
-			ShowFileInFolder(gRecordingPath);
+			// Only open folder if we have a valid recording file
+			// (prevents opening old folder when clicking tray icon after error notifications)
+			if (gRecordingPath[0] && GetFileAttributesW(gRecordingPath) != INVALID_FILE_ATTRIBUTES)
+			{
+				ShowFileInFolder(gRecordingPath);
+			}
 		}
 		return 0;
 	}
@@ -1042,6 +1104,7 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	{
 		if (gRecording)
 		{
+			LOG_INFO("Hotkey pressed during recording - stopping");
 			StopRecording();
 		}
 		else if (!gRecordingStarted)
@@ -1050,18 +1113,21 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			{
 				if (WParam == HOT_RECORD_WINDOW)
 				{
+					LOG_INFO("Hotkey: record window");
 					gRecordingStarted = TRUE;
 					CaptureWindow();
 					gRecordingStarted = FALSE;
 				}
 				else if (WParam == HOT_RECORD_MONITOR)
 				{
+					LOG_INFO("Hotkey: record monitor");
 					gRecordingStarted = TRUE;
 					CaptureMonitor();
 					gRecordingStarted = FALSE;
 				}
 				else if (WParam == HOT_RECORD_REGION)
 				{
+					LOG_INFO("Hotkey: record region");
 					gRecordingStarted = TRUE;
 					CaptureRegionInit();
 					gRecordingStarted = FALSE;
@@ -1099,6 +1165,7 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	}
 	else if (Message == WM_WCAP_STOP_CAPTURE)
 	{
+		LOG_INFO("WM_WCAP_STOP_CAPTURE received");
 		if (gRecording)
 		{
 			StopRecording();
@@ -1287,6 +1354,7 @@ static bool OnCaptureFrame(ScreenCapture* Capture, ScreenCaptureFrame* Frame)
 {
 	if (Frame == NULL)
 	{
+		LOG_WARN("OnCaptureFrame: capture item closed (Frame==NULL), posting stop");
 		PostMessageW(gWindow, WM_WCAP_STOP_CAPTURE, 0, 0);
 		return true;
 	}
@@ -1322,6 +1390,10 @@ static bool OnCaptureFrame(ScreenCapture* Capture, ScreenCaptureFrame* Frame)
 		{
 			// TODO: maybe highlight tray icon when droppped frames are increasing too much?
 			gRecordingDroppedFrames++;
+			if (gRecordingDroppedFrames <= 5 || (gRecordingDroppedFrames % 100) == 0)
+			{
+				LOG_WARN("Dropped video frame #%lu", gRecordingDroppedFrames);
+			}
 		}
 	}
 
@@ -1333,6 +1405,7 @@ static bool OnCaptureFrame(ScreenCapture* Capture, ScreenCaptureFrame* Frame)
 		{
 			if (Frame->Time - gEncoder.StartTime >= (UINT64)(gConfig.LimitLength * gTickFreq.QuadPart))
 			{
+				LOG_INFO("Recording length limit reached (%lu sec)", gConfig.LimitLength);
 				Stop = TRUE;
 			}
 		}
@@ -1345,6 +1418,7 @@ static bool OnCaptureFrame(ScreenCapture* Capture, ScreenCaptureFrame* Frame)
 			// reserve 0.5% for mp4 format overhead (probably an overestimate)
 			if (1000 * FileSize >= (995ULL * gConfig.LimitSize) << 20)
 			{
+				LOG_INFO("Recording size limit reached (%lu MB, file=%llu bytes)", gConfig.LimitSize, FileSize);
 				Stop = TRUE;
 			}
 		}
@@ -1378,6 +1452,9 @@ int WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR cmdline, int cmdshow)
 void WinMainCRTStartup()
 #endif
 {
+	Log__Init();
+	LOG_INFO("=== wcap starting === " WCAP_CONFIG_TITLE);
+
 	WNDCLASSEXW WindowClass =
 	{
 		.cbSize = sizeof(WindowClass),

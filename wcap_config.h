@@ -408,6 +408,7 @@ static LRESULT CALLBACK Config__ShortcutProc(HWND Window, UINT Message, WPARAM W
 
 	if (Message == WM_KEYUP || Message == WM_SYSKEYUP)
 	{
+		LOG_INFO("Config__ShortcutProc: key up WParam=0x%04X", WParam);
 		if (WParam != VK_LCONTROL &&  WParam != VK_RCONTROL && WParam != VK_CONTROL &&
 			WParam != VK_LSHIFT && WParam != VK_RSHIFT && WParam != VK_SHIFT &&
 			WParam != VK_LMENU && WParam != VK_RMENU && WParam != VK_MENU &&
@@ -416,10 +417,12 @@ static LRESULT CALLBACK Config__ShortcutProc(HWND Window, UINT Message, WPARAM W
 			DWORD Shortcut;
 			if (WParam == VK_ESCAPE)
 			{
+				LOG_INFO("Config__ShortcutProc: ESC pressed, canceling");
 				Shortcut = GetWindowLongW(Window, GWLP_USERDATA);
 			}
 			else if (WParam == VK_BACK)
 			{
+				LOG_INFO("Config__ShortcutProc: BACKSPACE pressed, clearing");
 				Shortcut = 0;
 			}
 			else
@@ -433,6 +436,7 @@ static LRESULT CALLBACK Config__ShortcutProc(HWND Window, UINT Message, WPARAM W
 					| ((GetKeyState(VK_SHIFT) >> 15)   ? MOD_SHIFT   : 0);
 
 				Shortcut = HOT_KEY(VirtualKey, Mods);
+				LOG_INFO("Config__ShortcutProc: shortcut captured: 0x%08X", Shortcut);
 			}
 
 			WCHAR Text[64];
@@ -454,6 +458,7 @@ static LRESULT CALLBACK Config__DialogProc(HWND Window, UINT Message, WPARAM WPa
 {
 	if (Message == WM_INITDIALOG)
 	{
+		LOG_INFO("Config__DialogProc: WM_INITDIALOG");
 		Config* C = (Config*)LParam;
 		SetWindowLongPtrW(Window, GWLP_USERDATA, (LONG_PTR)C);
 
@@ -478,18 +483,22 @@ static LRESULT CALLBACK Config__DialogProc(HWND Window, UINT Message, WPARAM WPa
 		SetForegroundWindow(Window);
 		gDialogWindow = Window;
 		gConfigShortcut.Control = 0;
+		LOG_INFO("Config__DialogProc: WM_INITDIALOG complete");
 		return TRUE;
 	}
 	else if (Message == WM_DESTROY)
 	{
+		LOG_INFO("Config__DialogProc: WM_DESTROY");
 		gDialogWindow = NULL;
 	}
 	else if (Message == WM_COMMAND)
 	{
 		Config* C = (Config*)GetWindowLongPtrW(Window, GWLP_USERDATA);
 		int Control = LOWORD(WParam);
+		LOG_INFO("Config__DialogProc: WM_COMMAND Control=%d", Control);
 		if (Control == ID_OK)
 		{
+			LOG_INFO("Config__DialogProc: ID_OK clicked");
 			// capture
 			C->MouseCursor              = IsDlgButtonChecked(Window, ID_MOUSE_CURSOR);
 			C->OnlyClientArea           = IsDlgButtonChecked(Window, ID_ONLY_CLIENT_AREA);
@@ -581,6 +590,7 @@ static LRESULT CALLBACK Config__DialogProc(HWND Window, UINT Message, WPARAM WPa
 		}
 		else if (Control == ID_OUTPUT_FOLDER + 1)
 		{
+			LOG_INFO("Config__DialogProc: Browse folder button clicked");
 			// this expects caller has called CoInitializeEx with single or apartment-threaded model
 			IFileDialog* Dialog;
 			HR(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC, &IID_IFileDialog, &Dialog));
@@ -596,8 +606,10 @@ static LRESULT CALLBACK Config__DialogProc(HWND Window, UINT Message, WPARAM WPa
 			}
 
 			HR(IFileDialog_SetOptions(Dialog, FOS_NOCHANGEDIR | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST));
+			LOG_INFO("Config__DialogProc: Calling IFileDialog_Show (blocking)...");
 			if (SUCCEEDED(IFileDialog_Show(Dialog, Window)) && SUCCEEDED(IFileDialog_GetResult(Dialog, &Folder)))
 			{
+				LOG_INFO("Config__DialogProc: IFileDialog_Show returned successfully");
 				LPWSTR Path;
 				if (SUCCEEDED(IShellItem_GetDisplayName(Folder, SIGDN_FILESYSPATH, &Path)))
 				{
@@ -614,6 +626,7 @@ static LRESULT CALLBACK Config__DialogProc(HWND Window, UINT Message, WPARAM WPa
 		          Control == ID_SHORTCUT_WINDOW ||
 		          Control == ID_SHORTCUT_REGION) && HIWORD(WParam) == BN_CLICKED)
 		{
+			LOG_INFO("Config__DialogProc: shortcut button %d clicked", Control);
 			if (gConfigShortcut.Control == 0)
 			{
 				SetDlgItemTextW(Window, Control, L"Press new shortcut, [ESC] to cancel, [BACKSPACE] to disable");
@@ -625,6 +638,7 @@ static LRESULT CALLBACK Config__DialogProc(HWND Window, UINT Message, WPARAM WPa
 				gConfigShortcut.WindowProc = (WNDPROC)GetWindowLongPtrW(ControlWindow, GWLP_WNDPROC);
 				SetWindowLongPtrW(ControlWindow, GWLP_WNDPROC, (LONG_PTR)&Config__ShortcutProc);
 				DisableHotKeys();
+				LOG_INFO("Config__DialogProc: entering shortcut capture mode");
 			}
 		}
 	}
@@ -1047,8 +1061,10 @@ void Config_Save(Config* C, LPCWSTR FileName)
 
 BOOL Config_ShowDialog(Config* C)
 {
+	LOG_INFO("Config_ShowDialog: entering (gDialogWindow=%p)", gDialogWindow);
 	if (gDialogWindow)
 	{
+		LOG_INFO("Config_ShowDialog: dialog already open, bringing to foreground");
 		SetForegroundWindow(gDialogWindow);
 		return FALSE;
 	}
@@ -1135,5 +1151,8 @@ BOOL Config_ShowDialog(Config* C)
 	BYTE __declspec(align(4)) Data[4096];
 	Config__DoDialogLayout(&Dialog, Data, sizeof(Data));
 
-	return (BOOL)DialogBoxIndirectParamW(GetModuleHandleW(NULL), (LPCDLGTEMPLATEW)Data, NULL, Config__DialogProc, (LPARAM)C);
+	LOG_INFO("Config_ShowDialog: calling DialogBoxIndirectParamW (blocking)...");
+	BOOL Result = (BOOL)DialogBoxIndirectParamW(GetModuleHandleW(NULL), (LPCDLGTEMPLATEW)Data, NULL, Config__DialogProc, (LPARAM)C);
+	LOG_INFO("Config_ShowDialog: DialogBoxIndirectParamW returned %d", Result);
+	return Result;
 }
