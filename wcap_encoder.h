@@ -1084,6 +1084,13 @@ static IMFMediaBufferVtbl EncoderAudioBufferVtbl =
 
 void Encoder_NewSamples(Encoder* Encoder, LPCVOID Samples, DWORD FrameCount, UINT64 Time, UINT64 TimePeriod)
 {
+	static uint32_t LogCount;
+	LogCount++;
+	if (LogCount <= 5 || (LogCount % 100) == 0)
+	{
+		LOG_INFO("Encoder_NewSamples: frame_count=%lu time=%llu (call #%u)", (unsigned long)FrameCount, Time, LogCount);
+	}
+
 	EncoderAudioBuffer Input =
 	{
 		.Buffer.lpVtbl = &EncoderAudioBufferVtbl,

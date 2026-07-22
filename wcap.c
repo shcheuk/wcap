@@ -57,6 +57,9 @@ __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 #define CMD_WCAP     1
 #define CMD_QUIT     2
 #define CMD_SETTINGS 3
+#define CMD_STOP     4
+// base ID for per-screen "Start Recording Screen N" items (offset by 0-based monitor index)
+#define CMD_SCREEN   100
 
 #define HOT_RECORD_WINDOW  1
 #define HOT_RECORD_MONITOR 2
@@ -506,6 +509,25 @@ static void CaptureWindow(void)
 	StartRecording(Device, Window);
 }
 
+// Core logic to start recording a specific monitor (used by hotkey and tray menu paths).
+static void CaptureSpecificMonitor(HMONITOR Monitor)
+{
+	ID3D11Device* Device = CreateDevice();
+	if (!Device)
+	{
+		return;
+	}
+
+	if (!ScreenCapture_CreateForMonitor(&gCapture, Device, Monitor, NULL))
+	{
+		ShowNotification(L"Cannot record selected monitor!", L"Error", NIIF_WARNING);
+		ID3D11Device_Release(Device);
+		return;
+	}
+
+	StartRecording(Device, NULL);
+}
+
 static void CaptureMonitor(void)
 {
 	POINT Mouse;
@@ -518,19 +540,41 @@ static void CaptureMonitor(void)
 		return;
 	}
 
-	ID3D11Device* Device = CreateDevice();
-	if (!Device)
+	CaptureSpecificMonitor(Monitor);
+}
+
+// callback used by CaptureMonitorByIndex to collect monitors in enumeration order
+typedef struct
+{
+	HMONITOR* Monitors;
+	int Count;
+	int Capacity;
+} MonitorList;
+
+static BOOL CALLBACK MonitorEnumProc(HMONITOR Monitor, HDC hdc, LPRECT rect, LPARAM lParam)
+{
+	MonitorList* List = (MonitorList*)lParam;
+	if (List->Count < List->Capacity)
 	{
+		List->Monitors[List->Count++] = Monitor;
+	}
+	return TRUE;
+}
+
+// Captures the n-th monitor (0-based index) found by EnumDisplayMonitors.
+static void CaptureMonitorByIndex(int Index)
+{
+	HMONITOR Monitors[16];
+	MonitorList List = { Monitors, 0, _countof(Monitors) };
+	EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, (LPARAM)&List);
+
+	if (Index < 0 || Index >= List.Count)
+	{
+		ShowNotification(L"Selected screen is not available!", L"Cannot Start Recording", NIIF_WARNING);
 		return;
 	}
 
-	if (!ScreenCapture_CreateForMonitor(&gCapture, Device, Monitor, NULL))
-	{
-		ShowNotification(L"Cannot record selected monitor!", L"Error", NIIF_WARNING);
-		return;
-	}
-
-	StartRecording(Device, NULL);
+	CaptureSpecificMonitor(Monitors[Index]);
 }
 
 static void CaptureRegionInit(void)
@@ -1041,6 +1085,33 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			HMENU Menu = CreatePopupMenu();
 			Assert(Menu);
 
+			if (gRecording)
+			{
+				AppendMenuW(Menu, MF_STRING, CMD_STOP, L"Stop Recording");
+			}
+			else
+			{
+				// enumerate available screens
+				HMONITOR Monitors[16];
+				MonitorList List = { Monitors, 0, _countof(Monitors) };
+				EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, (LPARAM)&List);
+
+				if (List.Count <= 1)
+				{
+					AppendMenuW(Menu, MF_STRING, CMD_SCREEN + 0, L"Start Recording");
+				}
+				else
+				{
+					for (int i = 0; i < List.Count; i++)
+					{
+						WCHAR Name[128];
+						StrFormat(Name, L"Start Recording Screen %d", i + 1);
+						AppendMenuW(Menu, MF_STRING, CMD_SCREEN + i, Name);
+					}
+				}
+			}
+
+			AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
 			AppendMenuW(Menu, MF_STRING, CMD_WCAP, WCAP_TITLE);
 			AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
 			AppendMenuW(Menu, MF_STRING | (gRecording ? MF_DISABLED : 0), CMD_SETTINGS, L"Settings");
@@ -1053,7 +1124,22 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			LOG_INFO("Tray right-click: calling TrackPopupMenu (blocking)...");
 			int Command = TrackPopupMenu(Menu, TPM_RETURNCMD | TPM_NONOTIFY, Mouse.x, Mouse.y, 0, Window, NULL);
 			LOG_INFO("Tray right-click: TrackPopupMenu returned, Command=%d", Command);
-			if (Command == CMD_WCAP)
+			if (Command == CMD_STOP)
+			{
+				StopRecording();
+			}
+			else if (Command >= CMD_SCREEN && Command < CMD_SCREEN + 16)
+			{
+				if (gRectContext == NULL)
+				{
+					int Index = Command - CMD_SCREEN;
+					LOG_INFO("Tray menu: start recording screen %d", Index + 1);
+					gRecordingStarted = TRUE;
+					CaptureMonitorByIndex(Index);
+					gRecordingStarted = FALSE;
+				}
+			}
+			else if (Command == CMD_WCAP)
 			{
 				ShellExecuteW(NULL, L"open", WCAP_URL, NULL, NULL, SW_SHOWNORMAL);
 			}
