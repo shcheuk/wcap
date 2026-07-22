@@ -1383,6 +1383,16 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 					Config_Save(&gConfig, gConfigPath);
 					DisableHotKeys();
 					EnableHotKeys();
+					
+					// apply logging setting immediately
+					if (gConfig.EnableLog && !gLogInitialized)
+					{
+						Log__Init();
+					}
+					else if (!gConfig.EnableLog && gLogInitialized)
+					{
+						Log__Shutdown();
+					}
 				}
 				LOG_INFO("Tray right-click: settings dialog closed");
 			}
@@ -1400,6 +1410,16 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 					Config_Save(&gConfig, gConfigPath);
 					DisableHotKeys();
 					EnableHotKeys();
+					
+					// apply logging setting immediately
+					if (gConfig.EnableLog && !gLogInitialized)
+					{
+						Log__Init();
+					}
+					else if (!gConfig.EnableLog && gLogInitialized)
+					{
+						Log__Shutdown();
+					}
 				}
 				LOG_INFO("Tray double-click: settings dialog closed");
 			}
@@ -1767,7 +1787,19 @@ int WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR cmdline, int cmdshow)
 void WinMainCRTStartup()
 #endif
 {
-	Log__Init();
+	// load config first to check if logging is enabled
+	GetModuleFileNameW(NULL, gConfigPath, _countof(gConfigPath));
+	PathRenameExtensionW(gConfigPath, L".ini");
+
+	Config_Defaults(&gConfig);
+	Config_Load(&gConfig, gConfigPath);
+
+	// only enable logging if EnableLog=1 in the INI file
+	// most users don't need it, and it writes to disk on every log call
+	if (gConfig.EnableLog)
+	{
+		Log__Init();
+	}
 	LOG_INFO("=== wcap starting === " WCAP_CONFIG_TITLE);
 
 	WNDCLASSEXW WindowClass =
@@ -1791,13 +1823,8 @@ void WinMainCRTStartup()
 		ExitProcess(0);
 	}
 
-	GetModuleFileNameW(NULL, gConfigPath, _countof(gConfigPath));
-	PathRenameExtensionW(gConfigPath, L".ini");
-
 	HR(CoInitializeEx(0, COINIT_APARTMENTTHREADED));
 
-	Config_Defaults(&gConfig);
-	Config_Load(&gConfig, gConfigPath);
 	ScreenCapture_Create(&gCapture, &OnCaptureFrame, false);
 	Encoder_Init(&gEncoder);
 

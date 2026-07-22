@@ -58,6 +58,8 @@ typedef struct
 	DWORD ShortcutMonitor;
 	DWORD ShortcutWindow;
 	DWORD ShortcutRegion;
+	// advanced
+	BOOL EnableLog;
 }
 Config;
 
@@ -101,6 +103,7 @@ static BOOL Config_ShowDialog(Config* C);
 #define ID_FRAGMENTED_MP4          120
 #define ID_LIMIT_LENGTH            130
 #define ID_LIMIT_SIZE              140
+#define ID_ENABLE_LOG              150
 
 #define ID_VIDEO_GAMMA_RESIZE      200
 #define ID_VIDEO_IMPROVED_CONVERT  210
@@ -341,6 +344,7 @@ static void Config__SetDialogValues(HWND Window, Config* C)
 	CheckDlgButton(Window, ID_FRAGMENTED_MP4,  C->FragmentedOutput);
 	CheckDlgButton(Window, ID_LIMIT_LENGTH,    C->EnableLimitLength);
 	CheckDlgButton(Window, ID_LIMIT_SIZE,      C->EnableLimitSize);
+	CheckDlgButton(Window, ID_ENABLE_LOG,      C->EnableLog);
 	SetDlgItemInt(Window, ID_LIMIT_LENGTH + 1, C->LimitLength, FALSE);
 	SetDlgItemInt(Window, ID_LIMIT_SIZE + 1,   C->LimitSize,   FALSE);
 
@@ -520,6 +524,7 @@ static LRESULT CALLBACK Config__DialogProc(HWND Window, UINT Message, WPARAM WPa
 			C->FragmentedOutput  = IsDlgButtonChecked(Window, ID_FRAGMENTED_MP4);
 			C->EnableLimitLength = IsDlgButtonChecked(Window, ID_LIMIT_LENGTH);
 			C->EnableLimitSize   = IsDlgButtonChecked(Window, ID_LIMIT_SIZE);
+			C->EnableLog         = IsDlgButtonChecked(Window, ID_ENABLE_LOG);
 			C->LimitLength       = GetDlgItemInt(Window,      ID_LIMIT_LENGTH + 1, NULL, FALSE);
 			C->LimitSize         = GetDlgItemInt(Window,      ID_LIMIT_SIZE + 1,   NULL, FALSE);
 			// video
@@ -907,6 +912,8 @@ void Config_Defaults(Config* C)
 		.ShortcutMonitor = HOT_KEY(VK_SNAPSHOT, MOD_CONTROL),
 		.ShortcutWindow = HOT_KEY(VK_SNAPSHOT, MOD_CONTROL | MOD_WIN),
 		.ShortcutRegion = HOT_KEY(VK_SNAPSHOT, MOD_CONTROL | MOD_SHIFT),
+		// advanced
+		.EnableLog = FALSE,
 	};
 
 	LPWSTR VideoFolder;
@@ -1020,6 +1027,8 @@ void Config_Load(Config* C, LPCWSTR FileName)
 	Config__GetInt(FileName, L"ShortcutMonitor", &C->ShortcutMonitor, NULL);
 	Config__GetInt(FileName, L"ShortcutWindow",  &C->ShortcutWindow,  NULL);
 	Config__GetInt(FileName, L"ShortcutRect",    &C->ShortcutRegion,  NULL);
+	// advanced
+	Config__GetBool(FileName, L"EnableLog", &C->EnableLog);
 
 	Config__ValidateVideoProfile(C);
 }
@@ -1071,6 +1080,8 @@ void Config_Save(Config* C, LPCWSTR FileName)
 	Config__WriteInt(FileName, L"ShortcutMonitor", C->ShortcutMonitor);
 	Config__WriteInt(FileName, L"ShortcutWindow",  C->ShortcutWindow);
 	Config__WriteInt(FileName, L"ShortcutRect",    C->ShortcutRegion);
+	// advanced
+	WritePrivateProfileStringW(INI_SECTION, L"EnableLog", C->EnableLog ? L"1" : L"0", FileName);
 }
 
 BOOL Config_ShowDialog(Config* C)
@@ -1114,6 +1125,7 @@ BOOL Config_ShowDialog(Config* C)
 					{ "Fragmented MP&4 (H264 only)", ID_FRAGMENTED_MP4, ITEM_CHECKBOX                   },
 					{ "Limit &Length (seconds)",     ID_LIMIT_LENGTH,   ITEM_CHECKBOX | ITEM_NUMBER, 80 },
 					{ "Limit &Size (MB)",            ID_LIMIT_SIZE,     ITEM_CHECKBOX | ITEM_NUMBER, 80 },
+					{ "Enable &Log File",            ID_ENABLE_LOG,     ITEM_CHECKBOX                   },
 					{ NULL },
 				},
 			},
