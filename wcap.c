@@ -61,6 +61,9 @@ __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 // base ID for per-screen "Start Recording Screen N" items (offset by 0-based monitor index)
 #define CMD_SCREEN   100
 
+// max number of monitors supported in the tray menu
+#define WCAP_MAX_MONITORS 16
+
 #define HOT_RECORD_WINDOW  1
 #define HOT_RECORD_MONITOR 2
 #define HOT_RECORD_REGION  3
@@ -103,6 +106,11 @@ static UINT64 gRecordingNextEncode;
 static UINT64 gRecordingNextTooltip;
 static EXECUTION_STATE gRecordingState;
 static WCHAR gRecordingPath[MAX_PATH];
+
+// encoder watchdog: detects when the main thread is blocked in WriteSample
+static HANDLE gWatchdogThread;
+static HANDLE gWatchdogStopEvent;
+static _Atomic(uint32_t) gWatchdogHeartbeat; // incremented by main thread each timer tick
 
 // when selecting rectangle to record
 static HMONITOR gRectMonitor;
@@ -197,6 +205,67 @@ static void ShowFileInFolder(LPCWSTR Filename)
 	{
 		HR(SHOpenFolderAndSelectItems(List, 0, NULL, 0));
 		CoTaskMemFree(List);
+	}
+}
+
+// Watchdog thread: detects when the main thread is blocked (e.g., in IMFSinkWriter_WriteSample)
+// and posts WM_WCAP_STOP_CAPTURE to force-stop the recording.
+#define WATCHDOG_CHECK_INTERVAL_MS  1000
+#define WATCHDOG_STALL_TIMEOUT_SEC  10
+
+static DWORD CALLBACK WatchdogThread(LPVOID Arg)
+{
+	HWND Window = (HWND)Arg;
+	uint32_t LastHeartbeat = atomic_load(&gWatchdogHeartbeat);
+	uint32_t StallCount = 0;
+
+	while (WaitForSingleObject(gWatchdogStopEvent, WATCHDOG_CHECK_INTERVAL_MS) == WAIT_TIMEOUT)
+	{
+		uint32_t CurrentHeartbeat = atomic_load(&gWatchdogHeartbeat);
+		if (CurrentHeartbeat == LastHeartbeat)
+		{
+			// main thread hasn't ticked since last check
+			StallCount++;
+			if (StallCount == WATCHDOG_STALL_TIMEOUT_SEC)
+			{
+				LOG_WARN("Watchdog: main thread unresponsive for %u seconds (encoder likely blocked in WriteSample)", StallCount);
+			}
+			else if (StallCount > WATCHDOG_STALL_TIMEOUT_SEC && (StallCount % 30) == 0)
+			{
+				LOG_WARN("Watchdog: main thread still unresponsive (%u seconds total)", StallCount);
+			}
+		}
+		else
+		{
+			if (StallCount >= WATCHDOG_STALL_TIMEOUT_SEC)
+			{
+				LOG_INFO("Watchdog: main thread recovered after %u seconds", StallCount);
+			}
+			StallCount = 0;
+			LastHeartbeat = CurrentHeartbeat;
+		}
+	}
+
+	return 0;
+}
+
+static void WatchdogStart(HWND Window)
+{
+	atomic_store(&gWatchdogHeartbeat, 0);
+	gWatchdogStopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+	gWatchdogThread = CreateThread(NULL, 0, &WatchdogThread, Window, 0, NULL);
+}
+
+static void WatchdogStop(void)
+{
+	if (gWatchdogStopEvent)
+	{
+		SetEvent(gWatchdogStopEvent);
+		WaitForSingleObject(gWatchdogThread, 3000);
+		CloseHandle(gWatchdogThread);
+		CloseHandle(gWatchdogStopEvent);
+		gWatchdogThread = NULL;
+		gWatchdogStopEvent = NULL;
 	}
 }
 
@@ -297,6 +366,8 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 	gRecordingState = SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
 	gRecording = TRUE;
 
+	WatchdogStart(gWindow);
+
 	LOG_INFO("=== Recording STARTED === file=%ls", gRecordingPath);
 
 	ID3D11Device_Release(Device);
@@ -353,6 +424,8 @@ static void StopRecording(void)
 
 	gRecording = FALSE;
 	SetThreadExecutionState(gRecordingState);
+
+	WatchdogStop();
 
 	if (gConfig.CaptureAudio)
 	{
@@ -543,7 +616,7 @@ static void CaptureMonitor(void)
 	CaptureSpecificMonitor(Monitor);
 }
 
-// callback used by CaptureMonitorByIndex to collect monitors in enumeration order
+// callback used by GetSortedMonitorList to collect monitors in enumeration order
 typedef struct
 {
 	HMONITOR* Monitors;
@@ -561,20 +634,149 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR Monitor, HDC hdc, LPRECT rect, LPA
 	return TRUE;
 }
 
-// Captures the n-th monitor (0-based index) found by EnumDisplayMonitors.
-static void CaptureMonitorByIndex(int Index)
+typedef struct
 {
-	HMONITOR Monitors[16];
-	MonitorList List = { Monitors, 0, _countof(Monitors) };
+	HMONITOR Monitor;
+	WCHAR DeviceName[CCHDEVICENAME]; // GDI device name, e.g. "\\.\DISPLAY2"
+	WCHAR FriendlyName[64];          // EDID name, e.g. "DELL U2720Q" (may be empty)
+	int DeviceNumber;                // number parsed from "DISPLAYn"
+} MonitorEntry;
+
+// Retrieves friendly monitor name (from EDID) matching given GDI device name ("\\.\DISPLAYn").
+static void GetMonitorFriendlyName(const WCHAR* GdiDeviceName, WCHAR* FriendlyName, int FriendlyNameCount)
+{
+	FriendlyName[0] = 0;
+
+	UINT32 NumPaths = 0;
+	UINT32 NumModes = 0;
+	if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &NumPaths, &NumModes) != ERROR_SUCCESS)
+	{
+		return;
+	}
+	if (NumPaths == 0 || NumPaths > 64 || NumModes > 128)
+	{
+		return;
+	}
+
+	DISPLAYCONFIG_PATH_INFO Paths[64];
+	DISPLAYCONFIG_MODE_INFO Modes[128];
+	if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &NumPaths, Paths, &NumModes, Modes, NULL) != ERROR_SUCCESS)
+	{
+		return;
+	}
+
+	for (UINT32 i = 0; i < NumPaths; i++)
+	{
+		DISPLAYCONFIG_SOURCE_DEVICE_NAME SourceName =
+		{
+			.header =
+			{
+				.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+				.size = sizeof(SourceName),
+				.adapterId = Paths[i].sourceInfo.adapterId,
+				.id = Paths[i].sourceInfo.id,
+			},
+		};
+		if (DisplayConfigGetDeviceInfo(&SourceName.header) != ERROR_SUCCESS)
+		{
+			continue;
+		}
+		if (lstrcmpiW(SourceName.viewGdiDeviceName, GdiDeviceName) != 0)
+		{
+			continue;
+		}
+
+		DISPLAYCONFIG_TARGET_DEVICE_NAME TargetName =
+		{
+			.header =
+			{
+				.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+				.size = sizeof(TargetName),
+				.adapterId = Paths[i].targetInfo.adapterId,
+				.id = Paths[i].targetInfo.id,
+			},
+		};
+		if (DisplayConfigGetDeviceInfo(&TargetName.header) == ERROR_SUCCESS && TargetName.monitorFriendlyDeviceName[0])
+		{
+			StrCpyNW(FriendlyName, TargetName.monitorFriendlyDeviceName, FriendlyNameCount);
+		}
+		return;
+	}
+}
+
+// Returns display name for menu: EDID name if available, "DISPLAYn" otherwise.
+static LPCWSTR MonitorDisplayName(const MonitorEntry* Entry)
+{
+	if (Entry->FriendlyName[0])
+	{
+		return Entry->FriendlyName;
+	}
+	LPCWSTR Display = StrStrW(Entry->DeviceName, L"DISPLAY");
+	return Display ? Display : Entry->DeviceName;
+}
+
+// Returns monitor list sorted by GDI device number (\\.\DISPLAY1, DISPLAY2, ...).
+// EnumDisplayMonitors order is unspecified, sorting keeps the numbering stable
+// across restarts so tray menu items always point at the same physical screen.
+static int GetSortedMonitorList(MonitorEntry* Entries, int Capacity)
+{
+	HMONITOR Monitors[WCAP_MAX_MONITORS];
+	MonitorList List = { Monitors, 0, WCAP_MAX_MONITORS };
 	EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, (LPARAM)&List);
 
-	if (Index < 0 || Index >= List.Count)
+	int Count = List.Count < Capacity ? List.Count : Capacity;
+	for (int i = 0; i < Count; i++)
+	{
+		MonitorEntry* Entry = &Entries[i];
+		Entry->Monitor = Monitors[i];
+		Entry->DeviceName[0] = 0;
+		Entry->FriendlyName[0] = 0;
+		Entry->DeviceNumber = 0;
+
+		MONITORINFOEXW Info = { .cbSize = sizeof(Info) };
+		if (GetMonitorInfoW(Monitors[i], (LPMONITORINFO)&Info))
+		{
+			StrCpyNW(Entry->DeviceName, Info.szDevice, _countof(Entry->DeviceName));
+
+			LPCWSTR Display = StrStrW(Entry->DeviceName, L"DISPLAY");
+			if (Display)
+			{
+				Entry->DeviceNumber = StrToIntW(Display + 7); // number right after "DISPLAY"
+			}
+
+			GetMonitorFriendlyName(Entry->DeviceName, Entry->FriendlyName, _countof(Entry->FriendlyName));
+		}
+	}
+
+	// insertion sort by DeviceNumber (count is tiny)
+	for (int i = 1; i < Count; i++)
+	{
+		MonitorEntry Temp = Entries[i];
+		int j = i - 1;
+		while (j >= 0 && Entries[j].DeviceNumber > Temp.DeviceNumber)
+		{
+			Entries[j + 1] = Entries[j];
+			j--;
+		}
+		Entries[j + 1] = Temp;
+	}
+
+	return Count;
+}
+
+// Captures the monitor at Index in GetSortedMonitorList order.
+static void CaptureMonitorByIndex(int Index)
+{
+	MonitorEntry Entries[WCAP_MAX_MONITORS];
+	int Count = GetSortedMonitorList(Entries, WCAP_MAX_MONITORS);
+
+	if (Index < 0 || Index >= Count)
 	{
 		ShowNotification(L"Selected screen is not available!", L"Cannot Start Recording", NIIF_WARNING);
 		return;
 	}
 
-	CaptureSpecificMonitor(Monitors[Index]);
+	CaptureSpecificMonitor(Entries[Index].Monitor);
 }
 
 static void CaptureRegionInit(void)
@@ -1032,6 +1234,10 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	{
 		if (gRecording)
 		{
+			// heartbeat for watchdog: increment on every timer tick so the watchdog
+			// knows the main thread is still processing messages
+			atomic_fetch_add(&gWatchdogHeartbeat, 1);
+
 			if (WParam == WCAP_AUDIO_CAPTURE_TIMER)
 			{
 				EncodeCapturedAudio();
@@ -1091,21 +1297,43 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			}
 			else
 			{
-				// enumerate available screens
-				HMONITOR Monitors[16];
-				MonitorList List = { Monitors, 0, _countof(Monitors) };
-				EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, (LPARAM)&List);
+				// enumerate available screens, sorted by stable GDI device number
+				MonitorEntry Entries[WCAP_MAX_MONITORS];
+				int Count = GetSortedMonitorList(Entries, WCAP_MAX_MONITORS);
 
-				if (List.Count <= 1)
+				if (Count <= 1)
 				{
 					AppendMenuW(Menu, MF_STRING, CMD_SCREEN + 0, L"Start Recording");
 				}
 				else
 				{
-					for (int i = 0; i < List.Count; i++)
+					for (int i = 0; i < Count; i++)
 					{
+						// first 10 characters of the display name (EDID name or "DISPLAYn")
+						WCHAR ShortName[11];
+						StrCpyNW(ShortName, MonitorDisplayName(&Entries[i]), _countof(ShortName));
+
+						// when two screens share the same name (e.g. two identical monitors),
+						// append the stable device number to tell them apart
+						BOOL Duplicate = FALSE;
+						for (int j = 0; j < Count; j++)
+						{
+							if (j != i && StrCmpNW(MonitorDisplayName(&Entries[i]), MonitorDisplayName(&Entries[j]), 10) == 0)
+							{
+								Duplicate = TRUE;
+								break;
+							}
+						}
+
 						WCHAR Name[128];
-						StrFormat(Name, L"Start Recording Screen %d", i + 1);
+						if (Duplicate)
+						{
+							StrFormat(Name, L"Start Recording %ls (%d)", ShortName, Entries[i].DeviceNumber);
+						}
+						else
+						{
+							StrFormat(Name, L"Start Recording %ls", ShortName);
+						}
 						AppendMenuW(Menu, MF_STRING, CMD_SCREEN + i, Name);
 					}
 				}
@@ -1128,7 +1356,7 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			{
 				StopRecording();
 			}
-			else if (Command >= CMD_SCREEN && Command < CMD_SCREEN + 16)
+			else if (Command >= CMD_SCREEN && Command < CMD_SCREEN + WCAP_MAX_MONITORS)
 			{
 				if (gRectContext == NULL)
 				{
