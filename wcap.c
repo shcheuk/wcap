@@ -249,7 +249,8 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 	if (gConfig.CaptureAudio)
 	{
 		HWND ApplicationWindow = gConfig.ApplicationLocalAudio && AudioCapture_CanCaptureApplicationLocal() ? Window : NULL;
-		if (!AudioCapture_Start(&gAudio, ApplicationWindow))
+		float MicGain = (float)gConfig.MicrophoneGain / 100.0f;
+		if (!AudioCapture_Start(&gAudio, ApplicationWindow, gConfig.CaptureMicrophone != FALSE, MicGain))
 		{
 			LOG_ERROR("AudioCapture_Start failed");
 			ShowNotification(L"Cannot capture audio!", L"Cannot Start Recording", NIIF_WARNING);
@@ -257,7 +258,7 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 			ID3D11Device_Release(Device);
 			return;
 		}
-		LOG_INFO("Audio capture started, format: rate=%lu channels=%lu", gAudio.Format->nSamplesPerSec, gAudio.Format->nChannels);
+		LOG_INFO("Audio capture started, format: rate=%lu channels=%lu mic=%d gain=%.2f", gAudio.Format->nSamplesPerSec, gAudio.Format->nChannels, gAudio.MicEnabled, MicGain);
 		EncConfig.AudioFormat = gAudio.Format;
 	}
 
