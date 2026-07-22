@@ -24,10 +24,19 @@ typedef struct
 {
 	IMFSample* Sample;         // sample to write, or NULL for stream tick / stop command
 	IMFTrackedSample* Tracked; // released after WriteSample (audio only), NULL otherwise
-	int StreamIndex;           // -1 = stop command (encoder thread finalizes & exits)
+	int StreamIndex;           // -1 = stop command (writer thread exits)
 	LONGLONG Tick;             // stream tick timestamp, used only when Sample == NULL
 }
 EncoderQueueItem;
+
+// single producer (main thread), single consumer (writer thread) ringbuffer queue
+typedef struct
+{
+	EncoderQueueItem Items[ENCODER_QUEUE_COUNT];
+	_Atomic(uint32_t) Read;
+	_Atomic(uint32_t) Write;
+}
+EncoderQueue;
 
 typedef struct
 {
@@ -47,12 +56,12 @@ typedef struct
 	int VideoStreamIndex;
 	int AudioStreamIndex;
 
-	// encoder thread does all blocking IMFSinkWriter calls (WriteSample/SendStreamTick/Finalize)
-	// single producer (main thread), single consumer (encoder thread) ringbuffer queue
-	HANDLE Thread;
-	EncoderQueueItem Queue[ENCODER_QUEUE_COUNT];
-	_Atomic(uint32_t) QueueRead;
-	_Atomic(uint32_t) QueueWrite;
+	// writer threads do all blocking IMFSinkWriter calls (WriteSample/SendStreamTick)
+	// separate video & audio queues/threads so a congested video encoder cannot stall audio
+	HANDLE VideoThread;
+	HANDLE AudioThread; // NULL when there is no audio stream
+	EncoderQueue VideoQueue;
+	EncoderQueue AudioQueue;
 
 	ID3D11RenderTargetView* InputView;
 
@@ -252,44 +261,44 @@ static IMFAsyncCallbackVtbl Encoder__AudioSampleCallbackVtbl =
 	.Invoke         = &Encoder__AudioInvoke,
 };
 
-static BOOL Encoder__QueueFull(Encoder* Encoder)
+static BOOL Encoder__QueueFull(EncoderQueue* Queue)
 {
-	uint32_t Write = atomic_load_explicit(&Encoder->QueueWrite, memory_order_relaxed);
-	uint32_t Read  = atomic_load_explicit(&Encoder->QueueRead, memory_order_acquire);
+	uint32_t Write = atomic_load_explicit(&Queue->Write, memory_order_relaxed);
+	uint32_t Read  = atomic_load_explicit(&Queue->Read, memory_order_acquire);
 	return (Write - Read) >= ENCODER_QUEUE_COUNT;
 }
 
 // caller must make sure queue is not full (single producer, so full check stays valid)
-static void Encoder__Enqueue(Encoder* Encoder, IMFSample* Sample, IMFTrackedSample* Tracked, int StreamIndex, LONGLONG Tick)
+static void Encoder__Enqueue(EncoderQueue* Queue, IMFSample* Sample, IMFTrackedSample* Tracked, int StreamIndex, LONGLONG Tick)
 {
-	uint32_t Write = atomic_load_explicit(&Encoder->QueueWrite, memory_order_relaxed);
-	Encoder->Queue[Write & (ENCODER_QUEUE_COUNT - 1)] = (EncoderQueueItem)
+	uint32_t Write = atomic_load_explicit(&Queue->Write, memory_order_relaxed);
+	Queue->Items[Write & (ENCODER_QUEUE_COUNT - 1)] = (EncoderQueueItem)
 	{
 		.Sample = Sample,
 		.Tracked = Tracked,
 		.StreamIndex = StreamIndex,
 		.Tick = Tick,
 	};
-	atomic_store_explicit(&Encoder->QueueWrite, Write + 1, memory_order_release);
-	WakeByAddressSingle((PVOID)&Encoder->QueueWrite);
+	atomic_store_explicit(&Queue->Write, Write + 1, memory_order_release);
+	WakeByAddressSingle((PVOID)&Queue->Write);
 }
 
-static BOOL Encoder__TryEnqueue(Encoder* Encoder, IMFSample* Sample, IMFTrackedSample* Tracked, int StreamIndex, LONGLONG Tick)
+static BOOL Encoder__TryEnqueue(EncoderQueue* Queue, IMFSample* Sample, IMFTrackedSample* Tracked, int StreamIndex, LONGLONG Tick)
 {
-	if (Encoder__QueueFull(Encoder))
+	if (Encoder__QueueFull(Queue))
 	{
 		return FALSE;
 	}
-	Encoder__Enqueue(Encoder, Sample, Tracked, StreamIndex, Tick);
+	Encoder__Enqueue(Queue, Sample, Tracked, StreamIndex, Tick);
 	return TRUE;
 }
 
-static void Encoder__WaitForQueueSpace(Encoder* Encoder)
+static void Encoder__WaitForQueueSpace(EncoderQueue* Queue)
 {
-	while (Encoder__QueueFull(Encoder))
+	while (Encoder__QueueFull(Queue))
 	{
-		uint32_t Read = atomic_load_explicit(&Encoder->QueueRead, memory_order_acquire);
-		WaitOnAddress((PVOID)&Encoder->QueueRead, &Read, sizeof(Read), INFINITE);
+		uint32_t Read = atomic_load_explicit(&Queue->Read, memory_order_acquire);
+		WaitOnAddress((PVOID)&Queue->Read, &Read, sizeof(Read), INFINITE);
 	}
 }
 
@@ -313,22 +322,20 @@ static BOOL Encoder__WaitForCallbacks(_Atomic(uint64_t)* Available, uint64_t Ful
 	}
 }
 
-// all blocking IMFSinkWriter calls happen here, so encoder MFT backpressure cannot block the main thread
-static DWORD CALLBACK Encoder__Thread(LPVOID Arg)
+// all blocking IMFSinkWriter calls happen on writer threads, so encoder MFT backpressure cannot block the main thread
+static void Encoder__WriterThread(Encoder* Encoder, EncoderQueue* Queue)
 {
-	Encoder* Encoder = Arg;
-
 	for (;;)
 	{
-		uint32_t Read = atomic_load_explicit(&Encoder->QueueRead, memory_order_relaxed);
-		while (Read == atomic_load_explicit(&Encoder->QueueWrite, memory_order_acquire))
+		uint32_t Read = atomic_load_explicit(&Queue->Read, memory_order_relaxed);
+		while (Read == atomic_load_explicit(&Queue->Write, memory_order_acquire))
 		{
-			WaitOnAddress((PVOID)&Encoder->QueueWrite, &Read, sizeof(Read), INFINITE);
+			WaitOnAddress((PVOID)&Queue->Write, &Read, sizeof(Read), INFINITE);
 		}
 
-		EncoderQueueItem Item = Encoder->Queue[Read & (ENCODER_QUEUE_COUNT - 1)];
-		atomic_store_explicit(&Encoder->QueueRead, Read + 1, memory_order_release);
-		WakeByAddressSingle((PVOID)&Encoder->QueueRead);
+		EncoderQueueItem Item = Queue->Items[Read & (ENCODER_QUEUE_COUNT - 1)];
+		atomic_store_explicit(&Queue->Read, Read + 1, memory_order_release);
+		WakeByAddressSingle((PVOID)&Queue->Read);
 
 		if (Item.StreamIndex < 0)
 		{
@@ -341,7 +348,7 @@ static DWORD CALLBACK Encoder__Thread(LPVOID Arg)
 			HRESULT hr = IMFSinkWriter_WriteSample(Encoder->Writer, Item.StreamIndex, Item.Sample);
 			if (FAILED(hr))
 			{
-				LOG_ERROR("Encoder__Thread: IMFSinkWriter_WriteSample (stream %d) failed: 0x%08lX", Item.StreamIndex, (unsigned long)hr);
+				LOG_ERROR("Encoder__WriterThread: IMFSinkWriter_WriteSample (stream %d) failed: 0x%08lX", Item.StreamIndex, (unsigned long)hr);
 			}
 			IMFSample_Release(Item.Sample);
 			if (Item.Tracked)
@@ -354,21 +361,23 @@ static DWORD CALLBACK Encoder__Thread(LPVOID Arg)
 			HRESULT hr = IMFSinkWriter_SendStreamTick(Encoder->Writer, Item.StreamIndex, Item.Tick);
 			if (FAILED(hr))
 			{
-				LOG_ERROR("Encoder__Thread: IMFSinkWriter_SendStreamTick failed: 0x%08lX", (unsigned long)hr);
+				LOG_ERROR("Encoder__WriterThread: IMFSinkWriter_SendStreamTick failed: 0x%08lX", (unsigned long)hr);
 			}
 		}
 	}
+}
 
-	LOG_INFO("Encoder__Thread: calling IMFSinkWriter_Finalize (this may take a while if encoder is congested)...");
-	HRESULT hr = IMFSinkWriter_Finalize(Encoder->Writer);
-	if (FAILED(hr))
-	{
-		LOG_ERROR("IMFSinkWriter_Finalize failed: 0x%08lX", (unsigned long)hr);
-	}
-	else
-	{
-		LOG_INFO("IMFSinkWriter_Finalize completed successfully");
-	}
+static DWORD CALLBACK Encoder__VideoThread(LPVOID Arg)
+{
+	Encoder* Encoder = Arg;
+	Encoder__WriterThread(Encoder, &Encoder->VideoQueue);
+	return 0;
+}
+
+static DWORD CALLBACK Encoder__AudioThread(LPVOID Arg)
+{
+	Encoder* Encoder = Arg;
+	Encoder__WriterThread(Encoder, &Encoder->AudioQueue);
 	return 0;
 }
 
@@ -390,14 +399,14 @@ static void Encoder__OutputAudioSamples(Encoder* Encoder, BOOL WaitForSpace)
 			Available = atomic_load(&Encoder->AudioSampleAvailable);
 		}
 
-		// don't produce more output than encoder thread queue can hold
-		while (Encoder__QueueFull(Encoder))
+		// don't produce more output than audio writer thread queue can hold
+		while (Encoder__QueueFull(&Encoder->AudioQueue))
 		{
 			if (!WaitForSpace)
 			{
 				return;
 			}
-			Encoder__WaitForQueueSpace(Encoder);
+			Encoder__WaitForQueueSpace(&Encoder->AudioQueue);
 		}
 
 		DWORD Index;
@@ -431,8 +440,8 @@ static void Encoder__OutputAudioSamples(Encoder* Encoder, BOOL WaitForSpace)
 			LOG_INFO("Encoder__OutputAudioSamples: queueing audio buffer %lu for encoder thread (total %llu)", (unsigned long)Index, SubmitCount + 1);
 		}
 
-		// encoder thread will call WriteSample and release Sample & Tracked references
-		Encoder__Enqueue(Encoder, Sample, Tracked, Encoder->AudioStreamIndex, 0);
+		// audio writer thread will call WriteSample and release Sample & Tracked references
+		Encoder__Enqueue(&Encoder->AudioQueue, Sample, Tracked, Encoder->AudioStreamIndex, 0);
 	}
 }
 
@@ -959,10 +968,18 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 	Writer = NULL;
 	Resampler = NULL;
 
-	atomic_init(&Encoder->QueueRead, 0);
-	atomic_init(&Encoder->QueueWrite, 0);
-	Encoder->Thread = CreateThread(NULL, 0, &Encoder__Thread, Encoder, 0, NULL);
-	Assert(Encoder->Thread);
+	atomic_init(&Encoder->VideoQueue.Read, 0);
+	atomic_init(&Encoder->VideoQueue.Write, 0);
+	atomic_init(&Encoder->AudioQueue.Read, 0);
+	atomic_init(&Encoder->AudioQueue.Write, 0);
+	Encoder->VideoThread = CreateThread(NULL, 0, &Encoder__VideoThread, Encoder, 0, NULL);
+	Assert(Encoder->VideoThread);
+	Encoder->AudioThread = NULL;
+	if (Encoder->AudioStreamIndex >= 0)
+	{
+		Encoder->AudioThread = CreateThread(NULL, 0, &Encoder__AudioThread, Encoder, 0, NULL);
+		Assert(Encoder->AudioThread);
+	}
 
 	Result = TRUE;
 
@@ -1022,14 +1039,38 @@ void Encoder_Stop(Encoder* Encoder)
 		}
 	}
 
-	// enqueue stop command, encoder thread will call Finalize after everything before it is written
-	LOG_INFO("Encoder_Stop: waiting for encoder thread to drain queue & finalize...");
-	while (!Encoder__TryEnqueue(Encoder, NULL, NULL, -1, 0))
+	// enqueue stop commands, writer threads exit after everything before it is written
+	LOG_INFO("Encoder_Stop: waiting for writer threads to drain queues...");
+	while (!Encoder__TryEnqueue(&Encoder->VideoQueue, NULL, NULL, -1, 0))
 	{
-		Encoder__WaitForQueueSpace(Encoder);
+		Encoder__WaitForQueueSpace(&Encoder->VideoQueue);
 	}
-	WaitForSingleObject(Encoder->Thread, INFINITE);
-	CloseHandle(Encoder->Thread);
+	if (Encoder->AudioStreamIndex >= 0)
+	{
+		while (!Encoder__TryEnqueue(&Encoder->AudioQueue, NULL, NULL, -1, 0))
+		{
+			Encoder__WaitForQueueSpace(&Encoder->AudioQueue);
+		}
+	}
+	WaitForSingleObject(Encoder->VideoThread, INFINITE);
+	CloseHandle(Encoder->VideoThread);
+	if (Encoder->AudioStreamIndex >= 0)
+	{
+		WaitForSingleObject(Encoder->AudioThread, INFINITE);
+		CloseHandle(Encoder->AudioThread);
+	}
+
+	// everything queued has been written, finalize the file (may take a while if encoder was congested)
+	LOG_INFO("Encoder_Stop: calling IMFSinkWriter_Finalize (this may take a while if encoder is congested)...");
+	HRESULT hr = IMFSinkWriter_Finalize(Encoder->Writer);
+	if (FAILED(hr))
+	{
+		LOG_ERROR("IMFSinkWriter_Finalize failed: 0x%08lX", (unsigned long)hr);
+	}
+	else
+	{
+		LOG_INFO("IMFSinkWriter_Finalize completed successfully");
+	}
 
 	// tracked sample callbacks fire asynchronously on MF workqueue threads and reference
 	// this Encoder struct, wait for all buffers to come back before releasing them so
@@ -1087,7 +1128,7 @@ BOOL Encoder_NewFrame(Encoder* Encoder, ID3D11Texture2D* Texture, RECT Rect, UIN
 	if (Available == 0)
 	{
 		// dropped frame - no SendStreamTick here, Encoder_Update handles
-		// periodic discontinuity ticks through the encoder thread queue
+		// periodic discontinuity ticks through the writer thread queue
 		Encoder->VideoDiscontinuity = TRUE;
 		return FALSE;
 	}
@@ -1154,8 +1195,8 @@ BOOL Encoder_NewFrame(Encoder* Encoder, ID3D11Texture2D* Texture, RECT Rect, UIN
 		IMFSample_DeleteItem(Sample, &MFSampleExtension_Discontinuity);
 	}
 
-	// if encoder thread queue is full, drop this frame instead of piling up
-	if (Encoder__QueueFull(Encoder))
+	// if video writer thread queue is full, drop this frame instead of piling up
+	if (Encoder__QueueFull(&Encoder->VideoQueue))
 	{
 		atomic_fetch_or(&Encoder->VideoSampleAvailable, 1ULL << Index);
 		Encoder->VideoDiscontinuity = TRUE;
@@ -1167,9 +1208,9 @@ BOOL Encoder_NewFrame(Encoder* Encoder, ID3D11Texture2D* Texture, RECT Rect, UIN
 	IMFTrackedSample_SetAllocator(Tracked, &Encoder->VideoSampleCallback, NULL);
 	IMFTrackedSample_Release(Tracked);
 
-	// submit to encoder thread which calls WriteSample in background (may block there without freezing us)
-	// encoder thread releases our Sample reference after WriteSample
-	Encoder__Enqueue(Encoder, Sample, NULL, Encoder->VideoStreamIndex, 0);
+	// submit to video writer thread which calls WriteSample in background (may block there without freezing us)
+	// writer thread releases our Sample reference after WriteSample
+	Encoder__Enqueue(&Encoder->VideoQueue, Sample, NULL, Encoder->VideoStreamIndex, 0);
 
 	return TRUE;
 }
@@ -1315,14 +1356,14 @@ void Encoder_NewSamples(Encoder* Encoder, LPCVOID Samples, DWORD FrameCount, UIN
 BOOL Encoder_Update(Encoder* Encoder, UINT64 Time, UINT64 TimePeriod)
 {
 	// if there was no frame during last second, add discontinuity
-	// tick goes through encoder thread queue, so it cannot block the caller
+	// tick goes through video writer thread queue, so it cannot block the caller
 	if ((int64_t)(Time - Encoder->VideoLastTime) >= (int64_t)TimePeriod)
 	{
 		Encoder->VideoLastTime = Time;
 		Encoder->VideoDiscontinuity = TRUE;
 
 		LONGLONG Timestamp = MFllMulDiv(Time - Encoder->StartTime, MF_UNITS_PER_SECOND, TimePeriod, 0);
-		Encoder__TryEnqueue(Encoder, NULL, NULL, Encoder->VideoStreamIndex, Timestamp);
+		Encoder__TryEnqueue(&Encoder->VideoQueue, NULL, NULL, Encoder->VideoStreamIndex, Timestamp);
 	}
 
 	// video stall detection: log when encoder is stalled (congestion guard in
